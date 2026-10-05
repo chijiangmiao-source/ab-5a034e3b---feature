@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -22,7 +23,7 @@ import threading
 import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(DATA_DIR, "seal.db.json")
@@ -38,6 +39,20 @@ BATCH_ID_RE = re.compile(r"^[A-Za-z0-9_.@:/\-]{1,64}$")
 
 VOTE_KIND_YES = "yes"
 VOTE_KIND_CONFLICT = "conflict"
+VOTE_KIND_LATE = "late"  # 封签后到达并被拒绝的未见过载荷（仅用于重传去重，不进快照）
+
+# 封存流水事件类型（稳定字符串，持久化后不可改名）。
+EVENT_ACCEPTED = "vote_accepted"       # 投票接受
+EVENT_CONFLICT = "conflict_isolated"   # 冲突隔离
+EVENT_SEALED = "sealed"                # 封签
+EVENT_LATE_REJECTED = "late_rejected"  # 封签后的迟到拒绝
+
+# 流水结果码（与投票接口的业务 code 对齐）。
+CODE_ACCEPTED = "VOTE_ACCEPTED"
+CODE_SEALED = "SEALED"
+
+JOURNAL_DEFAULT_LIMIT = 20
+JOURNAL_MAX_LIMIT = 100
 
 
 def utc_now() -> str:
@@ -96,6 +111,7 @@ class Store:
             if not isinstance(loaded, dict) or "batches" not in loaded:
                 raise RuntimeError(f"持久记录格式损坏: {self.path}")
             self.state = loaded
+            self._migrate_locked()
             sealed = sum(1 for b in self.state["batches"].values() if b.get("certificate"))
             print(
                 f"[recover] 从 {self.path} 恢复：批次 {len(self.state['batches'])} 个，"
@@ -103,6 +119,16 @@ class Store:
                 file=sys.stderr,
             )
         else:
+            self._persist_locked()
+
+    def _migrate_locked(self):
+        """旧版持久记录没有封存流水(events)：补齐字段，不伪造历史。调用方持锁。"""
+        changed = False
+        for b in self.state["batches"].values():
+            if "events" not in b or not isinstance(b.get("events"), list):
+                b["events"] = []
+                changed = True
+        if changed:
             self._persist_locked()
 
     def _persist_locked(self):
@@ -150,6 +176,7 @@ class Store:
             "conflicts": conflicts,
             "certificate": b["certificate"],
             "revision": revision,
+            "latest_event_seq": b["events"][-1]["seq"] if b.get("events") else 0,
         }
 
     def get_batch_snapshot(self, batch_id: str) -> dict:
@@ -163,6 +190,96 @@ class Store:
         with self.lock:
             return [self._snapshot(b, self.state["revision"]) for b in
                     sorted(self.state["batches"].values(), key=lambda x: x["id"])]
+
+    # ---------- 封存流水 ----------
+
+    def _append_event_locked(self, b, etype, station, vote_id, result_code, revision):
+        """追加一条流水。调用方持锁；seq 为批次内稳定序号，仅追加、不复用。"""
+        ev = {
+            "seq": len(b["events"]) + 1,
+            "type": etype,
+            "station": station,
+            "vote_id": vote_id,
+            "result_code": result_code,
+            "ts": utc_now(),
+            "revision": revision,   # 该变更提交后的全局 revision
+        }
+        b["events"].append(ev)
+        return ev
+
+    @staticmethod
+    def _encode_cursor(batch_id: str, seq: int) -> str:
+        raw = json.dumps({"b": batch_id, "s": seq}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    @staticmethod
+    def _decode_cursor(cursor: str):
+        try:
+            pad = "=" * (-len(cursor) % 4)
+            data = json.loads(base64.urlsafe_b64decode(cursor + pad).decode("utf-8"))
+            batch_id, seq = data["b"], data["s"]
+        except Exception:
+            batch_id, seq = None, None
+        if not isinstance(batch_id, str) or not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+            raise ApiError(
+                400, "INVALID_CURSOR",
+                "分页游标无法解析（可能已损坏或被截断）",
+                {"cursor": cursor,
+                 "hint": "请使用上一次响应返回的 next_cursor，或省略 cursor 从最新流水重新开始"},
+            )
+        return batch_id, seq
+
+    def read_journal(self, batch_id: str, limit, cursor):
+        """按批次读取封存流水：稳定序号、从最新向前分页。游标绑定批次归属。"""
+        with self.lock:
+            b = self.state["batches"].get(batch_id)
+            if b is None:
+                raise ApiError(404, "BATCH_NOT_FOUND", f"批次 {batch_id} 不存在", {"batch_id": batch_id})
+
+            if limit is None:
+                limit = JOURNAL_DEFAULT_LIMIT
+            elif isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= JOURNAL_MAX_LIMIT:
+                raise ApiError(
+                    422, "INVALID_PARAMETER",
+                    f"limit 必须是 1..{JOURNAL_MAX_LIMIT} 之间的整数",
+                    {"field": "limit", "max": JOURNAL_MAX_LIMIT},
+                )
+
+            events = b.get("events", [])
+            latest = len(events)
+            before = latest + 1  # 排他上界（seq < before）
+            if cursor is not None:
+                cursor_batch, cseq = self._decode_cursor(cursor)
+                if cursor_batch != batch_id:
+                    raise ApiError(
+                        400, "CURSOR_BATCH_MISMATCH",
+                        "该游标属于其他批次，不能用于读取本批次封存流水",
+                        {"cursor_batch_id": cursor_batch, "batch_id": batch_id,
+                         "hint": "请对当前批次重新发起不带 cursor 的请求，以获取属于本批次的游标"},
+                    )
+                if cseq < 1 or cseq > latest:
+                    raise ApiError(
+                        404, "CURSOR_OUT_OF_RANGE",
+                        f"游标指向的流水序号不存在（本批次现有 1..{latest}）",
+                        {"cursor_seq": cseq, "max_seq": latest,
+                         "hint": "请省略 cursor 从最新流水重新开始，或使用更小的历史序号"},
+                    )
+                before = cseq
+
+            end = before - 1                      # list 切片的排他上界
+            start = max(0, before - 1 - limit)
+            page = [dict(events[i]) for i in range(end - 1, start - 1, -1) if 0 <= i < latest]
+            has_more = start > 0
+            next_cursor = self._encode_cursor(batch_id, page[-1]["seq"]) if has_more and page else None
+            return {
+                "batch_id": batch_id,
+                "limit": limit,
+                "latest_seq": latest,
+                "revision": self.state["revision"],
+                "events": page,                    # 最新在前
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+            }
 
     # ---------- 批次创建（配置录入） ----------
 
@@ -209,6 +326,7 @@ class Store:
                 "digest": None,        # 由首次有效投票冻结
                 "frozen_at": None,
                 "votes": [],
+                "events": [],          # 封存流水：批次内稳定序号 1..N，仅追加
                 "certificate": None,
             }
             self.state["batches"][batch_id] = b
@@ -232,10 +350,11 @@ class Store:
         return None
 
     def _record_conflict(self, b, station, digest, vote_id, reason, detail):
-        """冲突票去重落盘；重传同一冲突载荷只回放。"""
+        """冲突票去重落盘；重传同一冲突载荷只回放。冲突隔离事件与快照同一次提交追加。"""
         existing = self._find_vote(b, station, digest, vote_id, VOTE_KIND_CONFLICT)
         replayed = existing is not None
         if existing is None:
+            new_rev = self.state["revision"] + 1
             b["votes"].append({
                 "id": f"v_{len(b['votes']) + 1}_{hashlib.sha1(os.urandom(16)).hexdigest()[:10]}",
                 "station": station,
@@ -245,7 +364,8 @@ class Store:
                 "reason": reason,
                 "ts": utc_now(),
             })
-            self.state["revision"] += 1
+            self._append_event_locked(b, EVENT_CONFLICT, station, vote_id, reason, new_rev)
+            self.state["revision"] = new_rev
             self._persist_locked()
         snap = self._snapshot(b, self.state["revision"])
         err = ApiError(
@@ -301,7 +421,7 @@ class Store:
                     "batch": self._snapshot(b, self.state["revision"]),
                 }
 
-            # 已记录过的冲突载荷重传：回放首次冲突结果，不重复堆积记录。
+            # 已记录过的冲突载荷重传：回放首次冲突结果，不重复堆积记录与流水。
             existing_conflict = self._find_vote(b, station, digest, vote_id, VOTE_KIND_CONFLICT)
             if existing_conflict is not None:
                 raise ApiError(
@@ -310,12 +430,38 @@ class Store:
                     {"replayed": True, "batch": self._snapshot(b, self.state["revision"])},
                 )
 
-            # 已封存且载荷未见过：迟到票一律拒绝，绝不可能改写证书。
+            # 已封存且载荷未见过：迟到票一律拒绝并在流水中留痕（可追溯），
+            # 绝不可能改写证书；同一载荷再次重传只回放首次拒绝，不产生第二条流水。
             if b["certificate"] is not None:
+                existing_late = self._find_vote(b, station, digest, vote_id, VOTE_KIND_LATE)
+                if existing_late is not None:
+                    raise ApiError(
+                        409, "LATE_VOTE_REJECTED",
+                        f"批次 {batch_id} 已封存：该迟到票此前已被拒绝，本次为重传回放",
+                        {"replayed": True, "late_event_seq": existing_late.get("event_seq"),
+                         "batch": self._snapshot(b, self.state["revision"])},
+                    )
+                new_rev = self.state["revision"] + 1
+                late = {
+                    "id": f"v_{len(b['votes']) + 1}_{hashlib.sha1(os.urandom(16)).hexdigest()[:10]}",
+                    "station": station,
+                    "digest": digest,
+                    "vote_id": vote_id,
+                    "kind": VOTE_KIND_LATE,
+                    "reason": "LATE_VOTE_REJECTED",
+                    "ts": utc_now(),
+                }
+                ev = self._append_event_locked(
+                    b, EVENT_LATE_REJECTED, station, vote_id, "LATE_VOTE_REJECTED", new_rev)
+                late["event_seq"] = ev["seq"]
+                b["votes"].append(late)
+                self.state["revision"] = new_rev
+                self._persist_locked()
                 raise ApiError(
                     409, "LATE_VOTE_REJECTED",
-                    f"批次 {batch_id} 已封存，证书不可变，迟到票被拒绝",
-                    {"batch": self._snapshot(b, self.state["revision"])},
+                    f"批次 {batch_id} 已封存，证书不可变，迟到票被拒绝（流水序号 #{ev['seq']}）",
+                    {"replayed": False, "late_event_seq": ev["seq"],
+                     "batch": self._snapshot(b, self.state["revision"])},
                 )
 
             # 摘要已冻结且不同：冲突隔离。
@@ -352,7 +498,14 @@ class Store:
             }
             b["votes"].append(vote)
 
-            snapshot = self._snapshot(b, self.state["revision"] + 1)
+            new_rev = self.state["revision"] + 1
+            # 投票接受事件与（若达到阈值的）封签事件在同一把锁、同一 revision、
+            # 同一次落盘提交中追加：二者要么同时可见，要么都不可见。
+            accept_ev = self._append_event_locked(
+                b, EVENT_ACCEPTED, station, vote_id, CODE_ACCEPTED, new_rev)
+            vote["event_seq"] = accept_ev["seq"]
+
+            snapshot = self._snapshot(b, new_rev)
             certificate = None
             # 达到阈值的瞬间在同一事务内封签；并发后到者只会看到已封存状态。
             if snapshot["yes_count"] >= b["threshold"]:
@@ -367,8 +520,11 @@ class Store:
                     "immutable": True,
                 }
                 b["certificate"] = certificate
+                # 封签事件紧随接受事件：seq 连续、revision 相同、只可能存在一个。
+                self._append_event_locked(
+                    b, EVENT_SEALED, station, vote_id, CODE_SEALED, new_rev)
 
-            self.state["revision"] += 1
+            self.state["revision"] = new_rev
             self._persist_locked()
             return 200, {
                 "accepted": True,
@@ -445,8 +601,13 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/batches":
                 self._send_json(200, {"batches": STORE.list_snapshots()})
             elif path.startswith("/api/batches/"):
-                batch_id = unquote(path[len("/api/batches/"):])
-                self._send_json(200, {"batch": STORE.get_batch_snapshot(batch_id)})
+                rest = unquote(path[len("/api/batches/"):])
+                if rest.endswith("/journal"):
+                    self._handle_journal(rest[: -len("/journal")], parsed.query)
+                elif "/" in rest:
+                    self._send_json(404, {"error": {"code": "NOT_FOUND", "message": path}})
+                else:
+                    self._send_json(200, {"batch": STORE.get_batch_snapshot(rest)})
             else:
                 self._send_json(404, {"error": {"code": "NOT_FOUND", "message": path}})
         except ApiError as err:
@@ -454,6 +615,23 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             traceback.print_exc()
             self._send_json(500, {"error": {"code": "INTERNAL", "message": "服务内部错误"}})
+
+    def _handle_journal(self, batch_id: str, query: str):
+        qs = parse_qs(query)
+        cursor = qs.get("cursor", [None])[0]
+        limit_raw = qs.get("limit", [None])[0]
+        limit = None
+        if limit_raw is not None:
+            try:
+                limit = int(limit_raw)
+            except (TypeError, ValueError):
+                raise ApiError(
+                    422, "INVALID_PARAMETER",
+                    f"limit 必须是 1..{JOURNAL_MAX_LIMIT} 之间的整数",
+                    {"field": "limit", "max": JOURNAL_MAX_LIMIT},
+                )
+        journal = STORE.read_journal(batch_id, limit, cursor)
+        self._send_json(200, {"journal": journal})
 
     def do_POST(self):
         try:

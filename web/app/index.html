@@ -57,6 +57,36 @@
   .rev { margin-left: auto; }
   .empty { color: var(--muted); text-align: center; padding: 30px 0; }
   .pill { display:inline-block; min-width: 20px; text-align:center; }
+  /* 封存流水 */
+  .journal { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+  .jtoggle {
+    margin: 0; padding: 4px 10px; font-size: 12px; background: transparent;
+    border: 1px solid var(--line); color: var(--muted); border-radius: 6px;
+  }
+  .jtoggle:hover { border-color: var(--accent); color: var(--text); }
+  .jbody { margin-top: 10px; }
+  ul.jlist { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow-y: auto; }
+  .jrow {
+    display: grid; grid-template-columns: 42px 84px 1fr; gap: 4px 10px;
+    padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 12px;
+  }
+  .jrow:hover { background: rgba(91,140,255,.07); }
+  .jseq { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .jtag { font-size: 11px; padding: 1px 8px; border-radius: 999px; text-align: center;
+    border: 1px solid var(--line); color: var(--muted); white-space: nowrap; height: fit-content; }
+  .jtag.j-acc { color: var(--ok); border-color: var(--ok); }
+  .jtag.j-conf { color: var(--err); border-color: var(--err); }
+  .jtag.j-seal { color: var(--seal); border-color: var(--seal); }
+  .jtag.j-late { color: var(--warn); border-color: var(--warn); }
+  .jmain { min-width: 0; }
+  .jmain .code { color: var(--muted); }
+  .jmain .meta { color: var(--muted); font-size: 11px; margin-top: 2px; word-break: break-all; }
+  .jfoot { margin-top: 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .jolder {
+    margin: 0; padding: 4px 12px; font-size: 12px; background: transparent;
+    border: 1px solid var(--line); color: var(--accent); border-radius: 6px;
+  }
+  .jerr { color: var(--err); font-size: 12px; white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -113,6 +143,190 @@
 // 前端防旧覆盖：按批次记录已渲染的最大 revision；封存状态永不降级。
 const seenRevision = {};
 let pollToken = 0;
+
+// 封存流水状态（按批次）：事件按稳定 seq 合并；任何较旧分页响应都不得覆盖更新内容。
+const journalState = {};
+const JOURNAL_LIMIT = 20;
+
+function jState(id) {
+  if (!journalState[id]) {
+    journalState[id] = {
+      open: false,
+      bySeq: new Map(),   // seq -> event（稳定序号，内容不可变）
+      headSeq: 0,        // 已加载的最大 seq
+      tailCursor: null,  // 继续向更早加载的不透明游标
+      hasOlder: false,
+      loading: false,
+      error: null,
+      reqId: 0,
+    };
+  }
+  return journalState[id];
+}
+
+const JOURNAL_TYPE_META = {
+  vote_accepted: { cls: "j-acc", label: "投票接受" },
+  conflict_isolated: { cls: "j-conf", label: "冲突隔离" },
+  sealed: { cls: "j-seal", label: "封签" },
+  late_rejected: { cls: "j-late", label: "迟到拒绝" },
+};
+
+function mergeJournalPage(id, j, isTail) {
+  const st = jState(id);
+  const oldHead = st.headSeq;
+  for (const ev of j.events || []) {
+    // 稳定序号内容固定：已存在的事件绝不被任何响应改写。
+    if (!st.bySeq.has(ev.seq)) st.bySeq.set(ev.seq, ev);
+  }
+  if (j.latest_seq > st.headSeq) st.headSeq = j.latest_seq;
+  if (isTail) {
+    // 向更早翻页：只有尾部游标随之推进。
+    st.tailCursor = j.has_more ? j.next_cursor : null;
+    st.hasOlder = j.has_more;
+  } else if (oldHead === 0) {
+    // 首次加载：初始化尾部翻页链。
+    st.tailCursor = j.has_more ? j.next_cursor : null;
+    st.hasOlder = j.has_more;
+  }
+  // 头部刷新不动 tailCursor：已展开的旧页链保持连续。
+}
+
+async function loadJournal(id, url, isTail) {
+  const st = jState(id);
+  const token = ++st.reqId;
+  st.loading = true;
+  st.error = null;
+  syncJournalOne(id);
+  try {
+    const r = await api("GET", url);
+    if (token !== st.reqId) return; // 已被更新的请求取代
+    const j = r.journal;
+    mergeJournalPage(id, j, isTail);
+    // 头部刷新若与本地之间存在缺口（两次轮询间新增超过一页），沿游标补齐到本地。
+    if (!isTail) {
+      let page = j, guard = 0;
+      const knownFloor = st.bySeq.size && token === st.reqId
+        ? Math.min(...[...st.bySeq.keys()].filter(s => !(page.events || []).some(e => e.seq === s)))
+        : null;
+      while (page.has_more && guard++ < 10 && token === st.reqId) {
+        const minSeq = page.events.length ? page.events[page.events.length - 1].seq : 0;
+        if (minSeq <= 1) break;
+        const rr = await api("GET",
+          `/api/batches/${encodeURIComponent(id)}/journal?limit=${JOURNAL_LIMIT}&cursor=${encodeURIComponent(page.next_cursor)}`);
+        if (token !== st.reqId) return;
+        page = rr.journal;
+        mergeJournalPage(id, page, false);
+        if (page.events.some(e => e.seq <= (knownFloor ?? 1))) break;
+      }
+    }
+  } catch (e) {
+    if (token !== st.reqId) return;
+    st.error = { msg: formatJournalError(e), code: e.code, fatal: e.code === "BATCH_NOT_FOUND" };
+  } finally {
+    if (token === st.reqId) st.loading = false;
+  }
+  syncJournalOne(id);
+}
+
+function loadJournalLatest(id) {
+  return loadJournal(id, `/api/batches/${encodeURIComponent(id)}/journal?limit=${JOURNAL_LIMIT}`, false);
+}
+
+function loadJournalOlder(id) {
+  const st = jState(id);
+  if (!st.tailCursor || st.loading) return;
+  return loadJournal(
+    id,
+    `/api/batches/${encodeURIComponent(id)}/journal?limit=${JOURNAL_LIMIT}&cursor=${encodeURIComponent(st.tailCursor)}`,
+    true,
+  );
+}
+
+function resetJournal(id) {
+  const open = jState(id).open;
+  journalState[id] = null;
+  const st = jState(id);
+  st.open = open;
+  return loadJournalLatest(id);
+}
+
+function toggleJournal(id) {
+  const st = jState(id);
+  st.open = !st.open;
+  if (st.open && st.bySeq.size === 0 && !st.loading) loadJournalLatest(id);
+  else syncJournalOne(id);
+}
+
+function formatJournalError(e) {
+  const lines = [`[${e.code || "ERROR"}] ${e.message}`];
+  if (e.details && e.details.hint) lines.push("可操作提示：" + e.details.hint);
+  if (e.code === "CURSOR_BATCH_MISMATCH" || e.code === "CURSOR_OUT_OF_RANGE" || e.code === "INVALID_CURSOR") {
+    lines.push("可点击「从最新重置」丢弃旧游标后重新加载。");
+  }
+  return lines.join("\n");
+}
+
+function journalRowHtml(ev) {
+  const meta = JOURNAL_TYPE_META[ev.type] || { cls: "", label: ev.type };
+  return `<li class="jrow">
+    <span class="jseq">#${ev.seq}</span>
+    <span class="jtag ${meta.cls}">${meta.label}</span>
+    <div class="jmain">
+      <div><strong>${esc(ev.station)}</strong> · vote_id=${esc(ev.vote_id)}
+        <span class="code">· ${esc(ev.result_code)}</span></div>
+      <div class="meta">${esc(ev.ts)} · 变更后 revision ${ev.revision}</div>
+    </div>
+  </li>`;
+}
+
+function syncJournalOne(id) {
+  const box = document.querySelector(`.journal[data-batch=${CSS.escape(JSON.stringify(id))}]`);
+  if (!box) return;
+  const st = jState(id);
+  const toggle = box.querySelector(".jtoggle");
+  const body = box.querySelector(".jbody");
+  const countAttr = box.dataset.latestSeq || "0";
+  toggle.textContent = `📜 封存流水（${countAttr} 条）${st.open ? "▾" : "▸"}`;
+  body.style.display = st.open ? "block" : "none";
+  if (!st.open) return;
+
+  const list = box.querySelector(".jlist");
+  const keepScroll = list ? list.scrollTop : 0;
+  const seqs = [...st.bySeq.keys()].sort((a, b) => b - a); // 最新在前
+  let inner;
+  if (st.error) {
+    inner = `<div class="jerr">${esc(st.error.msg)}</div>`;
+  } else if (seqs.length === 0) {
+    inner = `<div class="muted">${st.loading ? "流水加载中…" : "暂无流水。"}</div>`;
+  } else {
+    inner = `<ul class="jlist">${seqs.map(s => journalRowHtml(st.bySeq.get(s))).join("")}</ul>`;
+  }
+  const foot = [];
+  if (st.loading) foot.push('<span class="muted">加载中…</span>');
+  if (st.hasOlder && !st.error) {
+    foot.push(`<button class="jolder" onclick="loadJournalOlder(${JSON.stringify(id).replace(/"/g, "&quot;")})">加载更早的流水</button>`);
+  }
+  if (st.error && !st.error.fatal) {
+    foot.push(`<button class="jolder" onclick="resetJournal(${JSON.stringify(id).replace(/"/g, "&quot;")})">从最新重置</button>`);
+  }
+  foot.push('<span class="muted">仅追加 · 按稳定序号合并，较旧响应不会覆盖新内容</span>');
+  body.innerHTML = `${inner}<div class="jfoot">${foot.join("")}</div>`;
+  const nl = body.querySelector(".jlist");
+  if (nl) nl.scrollTop = keepScroll;
+}
+
+function syncAllJournals(freshLatestSeq) {
+  document.querySelectorAll(".journal[data-batch]").forEach(box => {
+    const id = JSON.parse(box.dataset.batch);
+    const st = jState(id);
+    if (st.open && freshLatestSeq && Object.prototype.hasOwnProperty.call(freshLatestSeq, id)
+        && freshLatestSeq[id] > st.headSeq && !st.loading) {
+      loadJournalLatest(id);
+    } else {
+      syncJournalOne(id);
+    }
+  });
+}
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => (
