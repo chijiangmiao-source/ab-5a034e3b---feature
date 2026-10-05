@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>深空辐照标定 · 批次封存控制台</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #141b30; --line: #28324f; --text: #e6ebff;
+    --muted: #8b97bd; --accent: #5b8cff; --ok: #36d399; --warn: #fbbd23;
+    --err: #f87272; --seal: #c084fc;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header { padding: 18px 28px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 14px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .layout { display: grid; grid-template-columns: 380px 1fr; gap: 20px; padding: 20px 28px; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-bottom: 18px; }
+  .card h2 { font-size: 14px; margin: 0 0 12px; letter-spacing: .04em; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input, textarea, select {
+    width: 100%; background: #0e1428; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font: inherit;
+  }
+  textarea { resize: vertical; min-height: 64px; }
+  button {
+    margin-top: 14px; background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+    padding: 9px 18px; font: inherit; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.ghost { background: transparent; border: 1px solid var(--line); color: var(--muted); }
+  .feedback { margin-top: 12px; padding: 9px 12px; border-radius: 6px; font-size: 13px; white-space: pre-wrap; word-break: break-all; display: none; }
+  .feedback.ok { display: block; background: rgba(54,211,153,.12); border: 1px solid var(--ok); color: var(--ok); }
+  .feedback.err { display: block; background: rgba(248,114,114,.12); border: 1px solid var(--err); color: var(--err); }
+  .batch { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+  .batch.sealed { border-color: var(--seal); box-shadow: 0 0 0 1px rgba(192,132,252,.25); }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .tag { font-size: 11px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .tag.collecting { color: var(--warn); border-color: var(--warn); }
+  .tag.sealed { color: var(--seal); border-color: var(--seal); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 20px; margin-top: 10px; font-size: 13px; }
+  .grid .k { color: var(--muted); }
+  ul.stations { margin: 6px 0 0; padding-left: 0; list-style: none; }
+  ul.stations li { font-size: 12px; padding: 2px 0; }
+  .yes { color: var(--ok); }
+  .conflict-item { color: var(--err); font-size: 12px; }
+  pre.cert {
+    background: #0e1428; border: 1px solid var(--seal); border-radius: 6px; padding: 10px;
+    font-size: 12px; overflow-x: auto; color: #e9d5ff; white-space: pre-wrap; word-break: break-all;
+  }
+  .muted { color: var(--muted); font-size: 12px; }
+  .rev { margin-left: auto; }
+  .empty { color: var(--muted); text-align: center; padding: 30px 0; }
+  .pill { display:inline-block; min-width: 20px; text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>深空辐照标定 · 批次封存控制台</h1>
+  <span class="sub">首次有效投票原子冻结配置 · 阈值到达唯一封签 · 持久化可恢复</span>
+  <span class="sub rev" id="poll-state">轮询中…</span>
+</header>
+
+<div class="layout">
+  <div>
+    <div class="card">
+      <h2>① 录入批次配置</h2>
+      <label>批次标识</label>
+      <input id="b-id" placeholder="如 IRR-2026-M42-07">
+      <label>固定站点名单（逗号或换行分隔）</label>
+      <textarea id="b-stations" placeholder="站A, 站B, 站C"></textarea>
+      <label>封存阈值（赞成站数）</label>
+      <input id="b-threshold" type="number" min="1" value="2">
+      <button onclick="createBatch()">创建批次</button>
+      <div class="feedback" id="fb-config"></div>
+    </div>
+
+    <div class="card">
+      <h2>② 站点提交稳定投票</h2>
+      <label>批次</label>
+      <select id="v-batch"></select>
+      <label>站点（须在冻结名单内）</label>
+      <input id="v-station" placeholder="站A">
+      <label>标定摘要 digest</label>
+      <input id="v-digest" placeholder="sha256:9f2c…">
+      <label>稳定投票标识（重传保持不变）</label>
+      <input id="v-voteid" placeholder="sv-20261004-A-0001">
+      <button onclick="castVote()">提交投票</button>
+      <div class="feedback" id="fb-vote"></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>批次实况（赞成票 / 冲突站点 / 封存证书）</h2>
+      <div id="batches"><div class="empty">尚无批次，先在左侧创建。</div></div>
+      <div style="margin-top:8px">
+        <button class="ghost" onclick="refreshNow()">立即刷新</button>
+        <span class="muted" style="margin-left:10px">每 2 秒轮询；过期或较旧响应不会覆盖封存结果。</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// 前端防旧覆盖：按批次记录已渲染的最大 revision；封存状态永不降级。
+const seenRevision = {};
+let pollToken = 0;
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function showFeedback(id, kind, text) {
+  const el = document.getElementById(id);
+  el.className = "feedback " + kind;
+  el.textContent = text;
+}
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    cache: "no-store",
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* 非 JSON */ }
+  if (!res.ok || (data && data.error)) {
+    const e = (data && data.error) || { code: "HTTP_" + res.status, message: res.statusText };
+    const err = new Error(e.message);
+    err.code = e.code;
+    err.details = e.details || {};
+    throw err;
+  }
+  return data;
+}
+
+async function createBatch() {
+  const id = document.getElementById("b-id").value.trim();
+  const raw = document.getElementById("b-stations").value;
+  const stations = raw.split(/[\s,，;；\n]+/).map(s => s.trim()).filter(Boolean);
+  const threshold = Number(document.getElementById("b-threshold").value);
+  try {
+    const r = await api("POST", "/api/batches", { id, stations, threshold });
+    showFeedback("fb-config", "ok",
+      `批次「${r.batch.id}」已创建，${r.batch.stations.length} 座站点，阈值 ${r.batch.threshold}。`);
+    document.getElementById("b-id").value = "";
+    document.getElementById("b-stations").value = "";
+    refreshNow();
+  } catch (e) {
+    showFeedback("fb-config", "err", formatError(e));
+  }
+}
+
+async function castVote() {
+  const batch = document.getElementById("v-batch").value;
+  const station = document.getElementById("v-station").value.trim();
+  const digest = document.getElementById("v-digest").value.trim();
+  const vote_id = document.getElementById("v-voteid").value.trim();
+  if (!batch) { showFeedback("fb-vote", "err", "请先选择批次（批次须已创建）。"); return; }
+  try {
+    const r = await api("POST", `/api/batches/${encodeURIComponent(batch)}/votes`,
+      { station, digest, vote_id });
+    const parts = [];
+    parts.push(r.replayed ? "幂等重传：回放首次结果，未增票。" : "投票已记录。");
+    if (r.froze_config) parts.push("首次有效投票已原子冻结摘要。");
+    const b = r.batch;
+    parts.push(`赞成 ${b.yes_count}/${b.threshold}。`);
+    if (b.certificate) parts.push("批次已封存，证书不可变。");
+    showFeedback("fb-vote", "ok", parts.join("\n"));
+    refreshNow();
+  } catch (e) {
+    showFeedback("fb-vote", "err", formatError(e));
+    refreshNow();
+  }
+}
+
+function formatError(e) {
+  const lines = [`[${e.code || "ERROR"}] ${e.message}`];
+  if (e.details) {
+    const d = e.details;
+    if (d.batch) {
+      lines.push(`当前状态：${d.batch.status === "sealed" ? "已封存" : "收集中"}，`
+        + `赞成 ${d.batch.yes_count}/${d.batch.threshold}`);
+    }
+    if (Array.isArray(d.frozen_stations)) lines.push("冻结名单：" + d.frozen_stations.join(", "));
+    if (typeof d.replayed === "boolean") lines.push(d.replayed ? "（该冲突票此前已记录，本次为重传回放）" : "（新冲突，已隔离）");
+  }
+  lines.push("");
+  lines.push("可操作提示：" + hintFor(e.code));
+  return lines.join("\n");
+}
+
+function hintFor(code) {
+  switch (code) {
+    case "INVALID_PARAMETER": return "请检查输入字段类型与长度后重试。";
+    case "INVALID_BATCH_ID": return "批次标识仅允许字母数字与 _ . @ : / -，长度 1-64。";
+    case "INVALID_STATIONS": return "请提供至少 1 个、至多 100 个非空站点名。";
+    case "DUPLICATE_STATION": return "请去除站点名单中的重复项后再创建。";
+    case "INVALID_THRESHOLD": return "阈值须为 1 到站点数之间的整数。";
+    case "BATCH_EXISTS": return "该批次已在收集中，直接为其投票即可，无需重建。";
+    case "BATCH_SEALED": return "批次已封存，配置不可更改；如需复测请使用新批次标识。";
+    case "BATCH_NOT_FOUND": return "请先创建该批次，并核对批次标识拼写。";
+    case "STATION_NOT_LISTED": return "站点不在冻结名单中；请改用名单内站点，或新建批次。";
+    case "VOTE_ID_CHANGED": return "同站同摘要的重传必须保持同一稳定投票标识；该票已隔离。";
+    case "DIGEST_MISMATCH": return "摘要与首次冻结摘要不一致，不能参与封存；请核对标定数据。";
+    case "LATE_VOTE_REJECTED": return "批次已封存，迟到票不会改写证书；结果以证书为准。";
+    default: return "请根据错误信息修正请求后重试。";
+  }
+}
+
+function renderBatch(b) {
+  // 防旧：revision 倒退的响应（过期请求/轮询乱序）直接丢弃。
+  const prev = seenRevision[b.id];
+  if (prev !== undefined && b.revision < prev) return null;
+  seenRevision[b.id] = b.revision;
+
+  const sealed = !!b.certificate;
+  const conflicts = (b.conflicts || []).map(c =>
+    `<li class="conflict-item">⛔ ${esc(c.station)} · <span class="muted">${esc(c.reason)}</span>`
+    + `<div class="muted">digest=${esc(c.digest)} · vote_id=${esc(c.vote_id)} · ${esc(c.ts)}</div></li>`
+  ).join("");
+  const cert = sealed ? `<pre class="cert">${esc(JSON.stringify(b.certificate, null, 2))}</pre>` : "";
+  const frozen = b.digest
+    ? `<div class="grid">
+         <div class="k">冻结时间</div><div>${esc(b.frozen_at)}</div>
+         <div class="k">冻结摘要</div><div style="word-break:break-all">${esc(b.digest)}</div>
+       </div>`
+    : `<div class="muted" style="margin-top:8px">摘要尚未冻结：等待第一票来自名单内站点的有效投票。</div>`;
+
+  return `<div class="batch ${sealed ? "sealed" : ""}" data-batch="${esc(b.id)}" data-sealed="${sealed}">
+    <div class="row">
+      <strong>${esc(b.id)}</strong>
+      <span class="tag ${sealed ? "sealed" : "collecting"}">${sealed ? "🔒 已封存" : "⏳ 收集中"}</span>
+      <span class="tag">阈值 ${b.yes_count}/${b.threshold}</span>
+      <span class="tag rev">rev ${b.revision}</span>
+    </div>
+    <div class="grid">
+      <div class="k">固定站点名单（${b.stations.length}）</div><div></div>
+    </div>
+    <ul class="stations">${b.stations.map(s => {
+      const voted = b.yes_stations.includes(s);
+      return `<li>${voted ? "✅" : "⚪"} ${esc(s)} ${voted ? '<span class="yes">已赞成</span>' : ""}</li>`;
+    }).join("")}</ul>
+    ${frozen}
+    <div class="k muted" style="margin-top:10px">冲突站点（已隔离，不参与封存）</div>
+    ${conflicts ? `<ul class="stations">${conflicts}</ul>` : '<div class="muted">无冲突</div>'}
+    ${cert ? `<div class="k muted" style="margin-top:10px">不可变封存证书</div>${cert}` : ""}
+  </div>`;
+}
+
+function reconcileDom(htmlByBatch, order) {
+  // 双保险：即便后端返回了更“旧”的状态，也绝不能把已封存渲染回收集中。
+  const root = document.getElementById("batches");
+  const existing = {};
+  root.querySelectorAll(".batch").forEach(el => { existing[el.dataset.batch] = el; });
+
+  if (!order.length) {
+    root.innerHTML = '<div class="empty">尚无批次，先在左侧创建。</div>';
+    return;
+  }
+  // 若本次响应没有任何比本地更新的内容（全部过期被丢弃），保持现有 DOM 不动。
+  if (htmlByBatch.size === 0) return;
+  let html = "";
+  for (const id of order) {
+    const rendered = htmlByBatch.get(id);
+    if (rendered) { html += rendered; continue; }
+    // 本次响应未包含更新（revision 更旧被丢弃）——保留已渲染节点。
+    const keep = existing[id];
+    if (keep && keep.dataset.sealed === "true") html += keep.outerHTML;
+  }
+  root.innerHTML = html;
+
+  const sel = document.getElementById("v-batch");
+  const keepSel = sel.value;
+  sel.innerHTML = order.map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join("");
+  if (order.includes(keepSel)) sel.value = keepSel;
+}
+
+async function refreshNow() {
+  const token = ++pollToken;
+  const state = document.getElementById("poll-state");
+  try {
+    const r = await api("GET", "/api/batches");
+    if (token !== pollToken) return; // 过期响应丢弃
+    // 封存不可逆保护：若当前已见 sealed，则拒绝任何非 sealed 的渲染。
+    const htmlByBatch = new Map();
+    for (const b of r.batches) {
+      const wasSealedSeen = (window.__sealedSeen ||= {})[b.id];
+      if (wasSealedSeen && b.status !== "sealed") {
+        seenRevision[b.id] = (seenRevision[b.id] ?? 0) + 0;
+        continue;
+      }
+      if (b.status === "sealed") (window.__sealedSeen ||= {})[b.id] = true;
+      const html = renderBatch(b);
+      if (html) htmlByBatch.set(b.id, html);
+    }
+    const order = r.batches.map(b => b.id);
+    reconcileDom(htmlByBatch, order);
+    state.textContent = "已更新 · " + new Date().toLocaleTimeString();
+    state.style.color = "var(--ok)";
+  } catch (e) {
+    if (token !== pollToken) return;
+    state.textContent = "轮询失败：" + (e.message || e);
+    state.style.color = "var(--err)";
+  }
+}
+
+refreshNow();
+setInterval(refreshNow, 2000);
+</script>
+</body>
+</html>
