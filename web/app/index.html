@@ -57,6 +57,25 @@
   .rev { margin-left: auto; }
   .empty { color: var(--muted); text-align: center; padding: 30px 0; }
   .pill { display:inline-block; min-width: 20px; text-align:center; }
+  /* 封存流水 */
+  .tl-toggle { margin-top: 10px; padding: 5px 12px; font-size: 12px; }
+  .timeline { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 10px; }
+  .tl-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; font-size:12px; color:var(--muted); }
+  .tl-list { list-style: none; margin: 0; padding: 0; }
+  .tl-item { display:grid; grid-template-columns: 42px 1fr; gap:8px; padding:7px 0; border-bottom:1px solid rgba(40,50,79,.5); font-size:12px; }
+  .tl-seq { color: var(--muted); font-variant-numeric: tabular-nums; text-align:right; }
+  .tl-main { min-width:0; }
+  .tl-title { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .tl-code { font-size:10px; padding:1px 7px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
+  .tl-code.VOTE_ACCEPTED { color:var(--ok); border-color:var(--ok); }
+  .tl-code.VOTE_ID_CHANGED, .tl-code.DIGEST_MISMATCH, .tl-code.VOTE_CONFLICT { color:var(--err); border-color:var(--err); }
+  .tl-code.SEALED { color:var(--seal); border-color:var(--seal); }
+  .tl-code.LATE_VOTE_REJECTED { color:var(--warn); border-color:var(--warn); }
+  .tl-meta { color: var(--muted); margin-top:2px; word-break:break-all; }
+  .tl-rev { color:var(--accent); }
+  .tl-more { margin-top:8px; padding:5px 12px; font-size:12px; }
+  .tl-err { margin-top:8px; padding:8px 10px; border-radius:6px; font-size:12px; color:var(--err); background:rgba(248,114,114,.1); border:1px solid var(--err); white-space:pre-wrap; }
+  .tl-new { margin-left:auto; }
 </style>
 </head>
 <body>
@@ -256,6 +275,7 @@ function renderBatch(b) {
     <div class="k muted" style="margin-top:10px">冲突站点（已隔离，不参与封存）</div>
     ${conflicts ? `<ul class="stations">${conflicts}</ul>` : '<div class="muted">无冲突</div>'}
     ${cert ? `<div class="k muted" style="margin-top:10px">不可变封存证书</div>${cert}` : ""}
+    <div class="tl-root" data-tl-root="${esc(b.id)}"></div>
   </div>`;
 }
 
@@ -287,6 +307,208 @@ function reconcileDom(htmlByBatch, order) {
   if (order.includes(keepSel)) sel.value = keepSel;
 }
 
+// ------------------------------------------------------------ 封存流水
+// 只按批次内稳定 seq 追加合并：事件一经写入内容不可变，任何乱序/过期/旧页响应
+// 都无法改写已加载事件；loadedLatest 单调不减，较旧的 latest_seq 不会隐藏新事件。
+const tlState = {};
+
+function tlGet(bid) {
+  return tlState[bid] || (tlState[bid] = {
+    expanded: false,
+    bySeq: new Map(),
+    nextCursor: null,
+    hasMore: false,
+    loadedLatest: 0,
+    reqGen: 0,
+    loading: false,
+    loadingOlder: false,
+    error: null,
+  });
+}
+
+const TL_LABELS = {
+  vote_accepted: "投票接受",
+  vote_conflict: "冲突隔离",
+  sealed: "封签",
+  late_rejected: "迟到拒绝",
+};
+
+async function tlFetch(bid, params) {
+  const qs = params ? "?" + params.toString() : "";
+  return api("GET", `/api/batches/${encodeURIComponent(bid)}/events${qs}`);
+}
+
+async function loadLatestEvents(bid, silent) {
+  const st = tlGet(bid);
+  // 与“加载更早”互斥：乱序到达的分页响应不得互相改写游标。
+  if (st.loading || st.loadingOlder) return;
+  st.loading = true;
+  st.error = null;
+  renderTimeline(bid);
+  const gen = ++st.reqGen;
+  try {
+    const r = await tlFetch(bid, new URLSearchParams({ limit: "20" }));
+    if (gen !== st.reqGen) return;
+    tlMerge(st, r);
+  } catch (e) {
+    if (gen !== st.reqGen) return;
+    st.error = e;
+  } finally {
+    if (gen === st.reqGen) { st.loading = false; renderTimeline(bid); }
+  }
+}
+
+async function loadOlderEvents(bid) {
+  const st = tlGet(bid);
+  if (st.loading || st.loadingOlder || !st.hasMore || !st.nextCursor) return;
+  st.loadingOlder = true;
+  renderTimeline(bid);
+  const gen = ++st.reqGen;
+  try {
+    const r = await tlFetch(bid, new URLSearchParams({ limit: "20", cursor: st.nextCursor }));
+    if (gen !== st.reqGen) return;
+    tlMerge(st, r);
+  } catch (e) {
+    if (gen !== st.reqGen) return;
+    // 游标失效（不存在 / 不属于本批 / 已损坏）：给出可操作反馈，可一键从最新重载。
+    st.error = e;
+  } finally {
+    if (gen === st.reqGen) { st.loadingOlder = false; renderTimeline(bid); }
+  }
+}
+
+function tlMerge(st, r) {
+  // 同 seq 内容必然一致（事件只追加、不可变）；直接按键合并不丢不重。
+  for (const ev of r.events) st.bySeq.set(ev.seq, ev);
+  st.hasMore = !!r.has_more;
+  st.nextCursor = r.next_cursor || null;
+  // 单调不减：较旧响应不能把“已知最新序号”拉低而掩盖新事件。
+  if (typeof r.latest_seq === "number" && r.latest_seq > st.loadedLatest) {
+    st.loadedLatest = r.latest_seq;
+  }
+}
+
+function toggleTimeline(bid) {
+  const st = tlGet(bid);
+  st.expanded = !st.expanded;
+  if (st.expanded && st.bySeq.size === 0) {
+    loadLatestEvents(bid);
+  } else {
+    renderTimeline(bid);
+  }
+}
+
+function renderTimeline(bid) {
+  const root = findTimelineRoot(bid);
+  if (!root) return;
+  const st = tlGet(bid);
+  if (!st.expanded) {
+    root.innerHTML = `<button class="ghost tl-toggle" data-tl-toggle="${esc(bid)}">▸ 展开封存流水${
+      st.loadedLatest ? `（${st.loadedLatest} 条）` : ""}</button>`;
+    return;
+  }
+
+  const seqs = [...st.bySeq.keys()].sort((a, b) => b - a); // 最新在前
+  const items = seqs.map(seq => {
+    const ev = st.bySeq.get(seq);
+    return `<li class="tl-item">
+      <span class="tl-seq">#${ev.seq}</span>
+      <span class="tl-main">
+        <span class="tl-title">
+          <span class="tl-code ${esc(ev.result_code)}">${esc(ev.result_code)}</span>
+          <strong>${esc(TL_LABELS[ev.type] || ev.type)}</strong>
+          ${ev.station ? `· 站点 <strong>${esc(ev.station)}</strong>` : ""}
+        </span>
+        <span class="tl-meta">
+          ${ev.vote_id ? `投票标识 ${esc(ev.vote_id)}<br>` : ""}
+          ${ev.digest ? `digest=${esc(ev.digest)}<br>` : ""}
+          ${esc(ev.ts)} · 变更后 <span class="tl-rev">rev ${ev.revision}</span>
+          ${ev.type === "late_rejected" ? "<br>证书保持不变：该拒绝仅追加流水，不触及封签。" : ""}
+        </span>
+      </span>
+    </li>`;
+  }).join("");
+
+  let more = "";
+  if (st.hasMore) {
+    more = st.loadingOlder
+      ? '<div class="muted" style="margin-top:8px">正在加载更早的流水…</div>'
+      : `<button class="ghost tl-more" data-tl-more="${esc(bid)}">加载更早…</button>`;
+  } else if (seqs.length) {
+    more = '<div class="muted" style="margin-top:8px">已到流水起点。</div>';
+  }
+
+  let errBox = "";
+  if (st.error) {
+    const e = st.error;
+    const resetable = ["INVALID_CURSOR", "CURSOR_BATCH_MISMATCH"].includes(e.code);
+    const hint = e.details && e.details.hint ? `\n提示：${e.details.hint}` : "";
+    errBox = `<div class="tl-err">[${esc(e.code || "ERROR")}] ${esc(e.message || String(e))}${esc(hint)}
+${resetable
+  ? `<br><button class="ghost tl-more" data-tl-reset="${esc(bid)}">丢弃游标，从最新事件重新加载</button>`
+  : ""}</div>`;
+  }
+
+  const loading = st.loading ? '<div class="muted" style="margin-top:4px">正在从最新事件加载…</div>' : "";
+  root.innerHTML = `<div class="timeline">
+    <div class="tl-head">
+      <span>封存流水（最新在前，序号批次内稳定）</span>
+      <span class="tl-new">最新 #${st.loadedLatest}</span>
+      <button class="ghost tl-toggle" data-tl-toggle="${esc(bid)}" style="margin:0 0 0 auto">▾ 收起</button>
+    </div>
+    ${seqs.length ? `<ul class="tl-list">${items}</ul>` : '<div class="muted">该批次尚无流水事件。</div>'}
+    ${loading}${more}${errBox}
+  </div>`;
+}
+
+function findTimelineRoot(bid) {
+  let found = null;
+  document.querySelectorAll("[data-tl-root]").forEach(el => {
+    if (el.dataset.tlRoot === bid) found = el;
+  });
+  return found;
+}
+
+function hydrateTimelines(snapshots) {
+  // reconcileDom 重建批次 DOM 后调用：恢复已展开流水，并对有新事件的批次静默增量拉取。
+  const byId = {};
+  for (const b of snapshots) byId[b.id] = b;
+  for (const b of snapshots) {
+    const st = tlGet(b.id);
+    // 收起态用快照最新序号单调跟踪，按钮即可显示事件总数。
+    if (!st.expanded) {
+      if (typeof b.latest_event_seq === "number" && b.latest_event_seq > st.loadedLatest) {
+        st.loadedLatest = b.latest_event_seq;
+      }
+      renderTimeline(b.id);
+      continue;
+    }
+    if (typeof b.latest_event_seq === "number"
+        && b.latest_event_seq > st.loadedLatest && !st.loading) {
+      loadLatestEvents(b.id, true);
+    } else {
+      renderTimeline(b.id);
+    }
+  }
+}
+
+document.getElementById("batches").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-tl-toggle],[data-tl-more],[data-tl-reset]");
+  if (!btn) return;
+  const bid = btn.dataset.tlToggle ?? btn.dataset.tlMore ?? btn.dataset.tlReset;
+  if (btn.dataset.tlToggle !== undefined) toggleTimeline(bid);
+  else if (btn.dataset.tlMore !== undefined) loadOlderEvents(bid);
+  else {
+    const st = tlGet(bid);
+    st.error = null;
+    st.bySeq.clear();
+    st.loadedLatest = 0;
+    st.nextCursor = null;
+    st.hasMore = false;
+    loadLatestEvents(bid);
+  }
+});
+
 async function refreshNow() {
   const token = ++pollToken;
   const state = document.getElementById("poll-state");
@@ -295,6 +517,7 @@ async function refreshNow() {
     if (token !== pollToken) return; // 过期响应丢弃
     // 封存不可逆保护：若当前已见 sealed，则拒绝任何非 sealed 的渲染。
     const htmlByBatch = new Map();
+    const rendered = [];
     for (const b of r.batches) {
       const wasSealedSeen = (window.__sealedSeen ||= {})[b.id];
       if (wasSealedSeen && b.status !== "sealed") {
@@ -303,10 +526,12 @@ async function refreshNow() {
       }
       if (b.status === "sealed") (window.__sealedSeen ||= {})[b.id] = true;
       const html = renderBatch(b);
-      if (html) htmlByBatch.set(b.id, html);
+      if (html) { htmlByBatch.set(b.id, html); rendered.push(b); }
     }
     const order = r.batches.map(b => b.id);
     reconcileDom(htmlByBatch, order);
+    // DOM 重建后恢复/增量更新已展开的封存流水（只按稳定 seq 追加，不被旧响应覆盖）。
+    hydrateTimelines(rendered);
     state.textContent = "已更新 · " + new Date().toLocaleTimeString();
     state.style.color = "var(--ok)";
   } catch (e) {

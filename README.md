@@ -13,7 +13,8 @@ Docker Compose 一键交付页面、健康响应与自动验收。
 | 投票标识内容改变 / 不同摘要：**记录冲突、隔离、不参与封存** | `VOTE_ID_CHANGED` / `DIGEST_MISMATCH`，冲突票单列展示且重传去重回放 |
 | 站点不在冻结名单：**配置不符拒绝** | `STATION_NOT_LISTED`，响应附带冻结名单 |
 | 多站并发达到阈值：**只生成一份不可变证书** | 判定→计数→封签→fsync 落盘全部在全局锁同一临界区；证书含 SHA-256 指纹，`immutable=true` |
-| 已封存批次不可回收集中；迟到票不改写证书 | 未见新载荷 → `409 LATE_VOTE_REJECTED`；已接受载荷重传 → 回放 |
+| 已封存批次不可回收集中；迟到票不改写证书 | 未见新载荷 → `409 LATE_VOTE_REJECTED` 并在**封存流水**留痕（同载荷重传回放同一序号）；已接受载荷重传 → 回放 |
+| 封存流水按稳定序号可审计 | 投票接受 / 冲突隔离 / 封签 / 封签后拒绝各为一条只追加事件，含站点、稳定投票标识、结果码、发生时刻与变更后 `revision`；与批次快照**同一次持久化提交**落盘，重启后顺序内容逐字节一致 |
 | 写入/封签途中崩溃可恢复 | 临时文件 + `fsync` + 原子 `rename`；启动加载持久记录并清理半截 `.tmp` 文件 |
 | 刷新/轮询/过期响应不得用较旧状态覆盖封存 | 前端按批次比较 `revision` 丢弃过期响应；封存状态单向不可逆，不降级渲染 |
 | 无效参数可操作反馈 | 全部错误带机器可读 `code`、中文说明与修正提示 |
@@ -28,11 +29,12 @@ WEB_PORT=9090 docker compose up --build --abort-on-container-exit --exit-code-fr
 - `web`：交付页面 `http://localhost:${WEB_PORT:-8080}/` 与健康检查 `/health`，数据写入命名卷 `seal-data`。
 - `verify`：通过 `depends_on: service_healthy` **等待页面与健康响应可用后**执行
   `verify/verify.py`，覆盖：
-  1. 代码测试（unittest）：幂等重放回放、冲突票隔离、配置/参数拒绝；
-  2. 页面构建可用（`/` 返回含控制台与脚本的真实页面）；
-  3. API/HTTP 冒烟：健康响应、20 路并发投票封签唯一性、封存后 30 路并发冲击；
+  1. 代码测试（unittest）：幂等重放回放、冲突票隔离、配置/参数拒绝、封存流水顺序与游标；
+  2. 页面构建可用（`/` 返回含控制台、封存流水与脚本的真实页面）；
+  3. API/HTTP 冒烟：健康响应、20 路并发投票封签唯一性、封存后 30 路并发冲击、
+     并发临界只留一个封签事件；
   4. 重启恢复：复制线上持久记录冷启动全新进程（含两次重启 + 半截临时文件），
-     校验收集状态、赞成票、冲突票、证书逐字节一致与迟到票拒绝。
+     校验收集状态、赞成票、冲突票、证书与**封存流水逐字段一致**、迟到票拒绝留痕。
   
   **完成即退出，退出码 0/非 0 报告验收结果。**
 
@@ -61,13 +63,26 @@ WEB_PORT=9090 docker compose up --build --abort-on-container-exit --exit-code-fr
   达到阈值时 `batch.certificate` 一次性出现。
 - `422 VOTE_ID_CHANGED` / `422 DIGEST_MISMATCH`：冲突隔离（详情含 `replayed`、当前批次快照）。
 - `422 STATION_NOT_LISTED`、`422 INVALID_*`：配置不符 / 参数无效，附可操作字段。
-- `409 LATE_VOTE_REJECTED`：批次已封存且为未见过的新载荷。
+- `409 LATE_VOTE_REJECTED`：批次已封存且为未见过的新载荷；详情含 `event_seq`
+  （对应封存流水序号，可追溯），同一载荷重传时 `replayed=true` 且指向原序号，不新增流水。
 
 ### 查询
 - `GET /api/batches` / `GET /api/batches/{id}`：快照含 `status`、冻结配置、
-  `yes_count`/`yes_stations`、`conflicts[]`、`certificate`、单调 `revision`。
+  `yes_count`/`yes_stations`、`conflicts[]`、`certificate`、`latest_event_seq`、单调 `revision`。
+- `GET /api/batches/{id}/events?limit=20&cursor=<token>`：**按批次读取封存流水**。
+  省略 `cursor` 时返回最新一页（事件按 `seq` 由新到旧），跟随响应中的
+  `next_cursor` 继续向更早加载，直到 `has_more=false`；`limit` 范围 1..100（默认 20）。
+  - 每条事件：`seq`（批次内稳定序号，1 起、只追加、重启不变）、`type`
+    （`vote_accepted` / `vote_conflict` / `sealed` / `late_rejected`）、
+    `station`、`vote_id`（站点提交的稳定投票标识）、`record_id`（库内投票记录 id）、
+    `result_code`、`digest`、`detail`、`ts`、变更后 `revision`。
+  - 游标为不透明 token，内部绑定批次标识：损坏/无法解析 → `422 INVALID_CURSOR`；
+    序号不存在或越界 → `422 INVALID_CURSOR`（含 `latest_seq` 与修正提示）；
+    游标属于其他批次 → `422 CURSOR_BATCH_MISMATCH`；批次不存在 → `404 BATCH_NOT_FOUND`。
+  - 接受票与（达到阈值时的）封签共享同一 `revision`：二者在同一次持久化提交内追加。
 - `GET /health`：`{"status":"ok","revision":N}`，同时用于容器健康检查。
-- `GET /`：封存控制台页面（每 2 秒轮询，revision 防旧、封存不降级）。
+- `GET /`：封存控制台页面（每 2 秒轮询，revision 防旧、封存不降级；
+  每个批次卡片可展开封存流水，按 `seq` 合并去重，较旧响应不覆盖较新流水）。
 
 ## 持久化与证书
 

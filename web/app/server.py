@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -22,7 +23,7 @@ import threading
 import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(DATA_DIR, "seal.db.json")
@@ -35,9 +36,17 @@ STATION_MAX_LEN = 64
 DIGEST_MAX_LEN = 200
 VOTE_ID_MAX_LEN = 200
 BATCH_ID_RE = re.compile(r"^[A-Za-z0-9_.@:/\-]{1,64}$")
+EVENTS_DEFAULT_LIMIT = 20
+EVENTS_MAX_LIMIT = 100
 
 VOTE_KIND_YES = "yes"
 VOTE_KIND_CONFLICT = "conflict"
+
+# 封存流水事件类型（result_code 取值，写入后永不改变）。
+EVENT_VOTE_ACCEPTED = "VOTE_ACCEPTED"
+EVENT_VOTE_CONFLICT = "VOTE_CONFLICT"
+EVENT_SEALED = "SEALED"
+EVENT_LATE_REJECTED = "LATE_VOTE_REJECTED"
 
 
 def utc_now() -> str:
@@ -96,6 +105,13 @@ class Store:
             if not isinstance(loaded, dict) or "batches" not in loaded:
                 raise RuntimeError(f"持久记录格式损坏: {self.path}")
             self.state = loaded
+            # 旧版本记录可能没有封存流水：按已持久的投票/证书确定性回填，
+            # 回填结果在多次重启间保持一致。
+            for b in self.state["batches"].values():
+                b.setdefault("events", [])
+                b.setdefault("late_rejections", [])
+                if not b["events"] and b.get("votes"):
+                    self._backfill_events_locked(b)
             sealed = sum(1 for b in self.state["batches"].values() if b.get("certificate"))
             print(
                 f"[recover] 从 {self.path} 恢复：批次 {len(self.state['batches'])} 个，"
@@ -120,6 +136,106 @@ class Store:
             os.fsync(dfd)
         finally:
             os.close(dfd)
+
+    # ---------- 封存流水 ----------
+
+    def _append_event_locked(self, b, event_type, station, vote_id, result_code,
+                             detail=None, digest=None, record_id=None, ts=None):
+        """追加一条封存流水。调用方必须已在同一次提交内完成快照变更
+        （本方法不自建持久化边界，保证流水与批次状态原子提交）。
+
+        seq 为批次内严格递增的稳定序号（1 起），重启后不变；
+        revision 记录事件落盘后的全局 revision。
+        vote_id 为站点提交的稳定投票标识；record_id 为库内投票记录 id
+        （封签/拒绝等非投票事件为 None）。
+        """
+        seq = len(b["events"]) + 1
+        event = {
+            "seq": seq,
+            "type": event_type,
+            "station": station,
+            "vote_id": vote_id,
+            "record_id": record_id,
+            "result_code": result_code,
+            "digest": digest,
+            "detail": detail or {},
+            "ts": ts or utc_now(),
+            "revision": self.state["revision"],
+        }
+        b["events"].append(event)
+        return event
+
+    @staticmethod
+    def _event_public(e: dict) -> dict:
+        return {
+            "seq": e["seq"],
+            "type": e["type"],
+            "station": e["station"],
+            "vote_id": e["vote_id"],
+            "record_id": e.get("record_id"),
+            "result_code": e["result_code"],
+            "digest": e.get("digest"),
+            "detail": e.get("detail") or {},
+            "ts": e["ts"],
+            "revision": e["revision"],
+        }
+
+    def _backfill_events_locked(self, b):
+        """旧记录（无流水）冷启动时，依据持久投票与证书确定性重建流水。
+
+        按持久化顺序（即发生顺序）映射 接受/冲突 事件；封签发生在阈值第
+        threshold 张赞成票落盘的同一临界区，故在其后插入唯一封签事件。
+        迟到拒绝发生在封签之后且不入库，无从回填，也不允许伪造。
+        """
+        events = []
+        yes_seen = 0
+        seal_after = None
+        cert = b.get("certificate")
+        revision = self.state.get("revision", 0)
+        for v in b["votes"]:
+            if v["kind"] == VOTE_KIND_YES:
+                yes_seen += 1
+                events.append({
+                    "seq": len(events) + 1,
+                    "type": "vote_accepted",
+                    "station": v["station"],
+                    "vote_id": v["vote_id"],
+                    "record_id": v["id"],
+                    "result_code": EVENT_VOTE_ACCEPTED,
+                    "digest": v["digest"],
+                    "detail": {},
+                    "ts": v["ts"],
+                    "revision": revision,
+                })
+                if cert and seal_after is None and yes_seen == b["threshold"]:
+                    seal_after = v["id"]
+            else:
+                events.append({
+                    "seq": len(events) + 1,
+                    "type": "vote_conflict",
+                    "station": v["station"],
+                    "vote_id": v["vote_id"],
+                    "record_id": v["id"],
+                    "result_code": v.get("reason") or EVENT_VOTE_CONFLICT,
+                    "digest": v["digest"],
+                    "detail": {"reason": v.get("reason")},
+                    "ts": v["ts"],
+                    "revision": revision,
+                })
+            if cert and v["kind"] == VOTE_KIND_YES and v["id"] == seal_after:
+                events.append({
+                    "seq": len(events) + 1,
+                    "type": "sealed",
+                    "station": None,
+                    "vote_id": None,
+                    "record_id": None,
+                    "result_code": EVENT_SEALED,
+                    "digest": b["digest"],
+                    "detail": {"certificate_serial": cert.get("serial", 1)},
+                    "ts": cert["sealed_at"],
+                    "revision": revision,
+                })
+        b["events"] = events
 
     # ---------- 快照 ----------
 
@@ -149,6 +265,7 @@ class Store:
             "yes_stations": yes_stations,
             "conflicts": conflicts,
             "certificate": b["certificate"],
+            "latest_event_seq": len(b.get("events", [])),
             "revision": revision,
         }
 
@@ -163,6 +280,92 @@ class Store:
         with self.lock:
             return [self._snapshot(b, self.state["revision"]) for b in
                     sorted(self.state["batches"].values(), key=lambda x: x["id"])]
+
+    # ---------- 封存流水读取（按批次、稳定序号游标分页） ----------
+
+    @staticmethod
+    def _encode_cursor(batch_id: str, before_seq: int) -> str:
+        raw = json.dumps({"b": batch_id, "s": before_seq}, ensure_ascii=False,
+                         separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_cursor(cursor: str):
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            data = None
+        if not isinstance(data, dict) or not isinstance(data.get("b"), str) \
+                or isinstance(data.get("s"), bool) or not isinstance(data.get("s"), int):
+            raise ApiError(
+                422, "INVALID_CURSOR", "游标无法解析或已损坏",
+                {"cursor": cursor,
+                 "hint": "请原样使用上次响应中的 next_cursor；或省略 cursor 从最新事件重新加载"},
+            )
+        return data["b"], data["s"]
+
+    def get_events(self, batch_id: str, cursor=None, limit_raw=None):
+        """按批次读取封存流水：无游标时返回最新一页，此后沿 next_cursor 向更早翻页。"""
+        if limit_raw is None or limit_raw == "":
+            limit = EVENTS_DEFAULT_LIMIT
+        else:
+            try:
+                limit = int(limit_raw)
+            except (TypeError, ValueError):
+                raise ApiError(422, "INVALID_LIMIT", "limit 必须是正整数",
+                               {"limit": limit_raw, "max": EVENTS_MAX_LIMIT,
+                                "hint": f"请传 1..{EVENTS_MAX_LIMIT} 之间的整数，或省略使用默认值"})
+            if not 1 <= limit <= EVENTS_MAX_LIMIT:
+                raise ApiError(
+                    422, "INVALID_LIMIT",
+                    f"limit 必须在 1 与 {EVENTS_MAX_LIMIT} 之间",
+                    {"limit": limit, "max": EVENTS_MAX_LIMIT,
+                     "hint": f"请传 1..{EVENTS_MAX_LIMIT} 之间的整数，或省略使用默认值"},
+                )
+        with self.lock:
+            b = self.state["batches"].get(batch_id)
+            if b is None:
+                raise ApiError(404, "BATCH_NOT_FOUND", f"批次 {batch_id} 不存在",
+                               {"batch_id": batch_id,
+                                "hint": "请先创建该批次，或从批次列表中选择正确的标识"})
+            total = len(b["events"])
+            upper = total + 1  # 合法游标区间 [1, total+1]
+            if cursor:
+                cursor_batch, before_seq = self._decode_cursor(cursor)
+                if cursor_batch != batch_id:
+                    raise ApiError(
+                        422, "CURSOR_BATCH_MISMATCH",
+                        "游标不属于该批次，不能用于读取另一批次的流水",
+                        {"cursor_batch_id": cursor_batch, "batch_id": batch_id,
+                         "hint": "请省略 cursor 从该批次最新事件开始加载，再跟随返回的 next_cursor 翻页"},
+                    )
+                if before_seq < 1 or before_seq > upper:
+                    raise ApiError(
+                        422, "INVALID_CURSOR",
+                        f"游标指向的序号 {before_seq} 在该批次中不存在（当前有效序号 1..{total}）",
+                        {"batch_id": batch_id, "event_seq": before_seq,
+                         "latest_seq": total,
+                         "hint": "批次可能已按更短历史重新查询；请省略 cursor 从最新事件重新加载"},
+                    )
+            else:
+                before_seq = upper
+
+            # 严格按稳定 seq 由新到旧取窗口；序号即持久顺序，重启后不变。
+            window = [e for e in b["events"] if e["seq"] < before_seq]
+            window.sort(key=lambda e: e["seq"], reverse=True)
+            page = window[:limit]
+            has_more = bool(page) and page[-1]["seq"] > 1
+            next_cursor = self._encode_cursor(batch_id, page[-1]["seq"]) if has_more else None
+            return {
+                "batch_id": batch_id,
+                "events": [self._event_public(e) for e in page],
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+                "latest_seq": total,
+                "revision": self.state["revision"],
+            }
 
     # ---------- 批次创建（配置录入） ----------
 
@@ -209,6 +412,8 @@ class Store:
                 "digest": None,        # 由首次有效投票冻结
                 "frozen_at": None,
                 "votes": [],
+                "events": [],          # 封存流水（稳定 seq，仅追加）
+                "late_rejections": [],  # 封签后迟到载荷去重表（回放拒绝用）
                 "certificate": None,
             }
             self.state["batches"][batch_id] = b
@@ -231,12 +436,19 @@ class Store:
                 return v
         return None
 
+    @staticmethod
+    def _find_late_rejection_locked(b, station, digest, vote_id):
+        for r in b.get("late_rejections", []):
+            if r["station"] == station and r["digest"] == digest and r["vote_id"] == vote_id:
+                return r
+        return None
+
     def _record_conflict(self, b, station, digest, vote_id, reason, detail):
-        """冲突票去重落盘；重传同一冲突载荷只回放。"""
+        """冲突票隔离并在同一持久化提交内追加冲突流水；重传同一冲突载荷只回放。"""
         existing = self._find_vote(b, station, digest, vote_id, VOTE_KIND_CONFLICT)
         replayed = existing is not None
         if existing is None:
-            b["votes"].append({
+            record = {
                 "id": f"v_{len(b['votes']) + 1}_{hashlib.sha1(os.urandom(16)).hexdigest()[:10]}",
                 "station": station,
                 "digest": digest,
@@ -244,8 +456,16 @@ class Store:
                 "kind": VOTE_KIND_CONFLICT,
                 "reason": reason,
                 "ts": utc_now(),
-            })
+            }
+            b["votes"].append(record)
             self.state["revision"] += 1
+            # 流水与冲突记录在同一次提交内落盘（此时尚未 persist）。
+            self._append_event_locked(
+                b, "vote_conflict", station, vote_id, reason,
+                detail={"reason": reason, "digest_frozen": b["digest"],
+                        "digest_submitted": digest},
+                digest=digest, record_id=record["id"],
+            )
             self._persist_locked()
         snap = self._snapshot(b, self.state["revision"])
         err = ApiError(
@@ -310,12 +530,34 @@ class Store:
                     {"replayed": True, "batch": self._snapshot(b, self.state["revision"])},
                 )
 
-            # 已封存且载荷未见过：迟到票一律拒绝，绝不可能改写证书。
+            # 已封存且载荷未见过：迟到票一律拒绝并留痕，绝不可能改写证书。
+            # 同一迟到载荷重传只回放原拒绝（同一 seq），不产生第二条流水。
             if b["certificate"] is not None:
+                prior = self._find_late_rejection_locked(b, station, digest, vote_id)
+                if prior is None:
+                    self.state["revision"] += 1
+                    self._append_event_locked(
+                        b, "late_rejected", station, vote_id, EVENT_LATE_REJECTED,
+                        detail={"reason": EVENT_LATE_REJECTED,
+                                "certificate_serial": b["certificate"].get("serial", 1),
+                                "certificate_fingerprint": b["certificate"]["fingerprint"]},
+                        digest=digest,
+                    )
+                    b.setdefault("late_rejections", []).append({
+                        "station": station, "digest": digest, "vote_id": vote_id,
+                        "seq": b["events"][-1]["seq"],
+                    })
+                    self._persist_locked()
+                    replayed_late = False
+                    reject_seq = b["events"][-1]["seq"]
+                else:
+                    replayed_late = True
+                    reject_seq = prior["seq"]
                 raise ApiError(
                     409, "LATE_VOTE_REJECTED",
-                    f"批次 {batch_id} 已封存，证书不可变，迟到票被拒绝",
-                    {"batch": self._snapshot(b, self.state["revision"])},
+                    f"批次 {batch_id} 已封存，证书不可变，迟到票被拒绝（流水序号 #{reject_seq}）",
+                    {"replayed": replayed_late, "event_seq": reject_seq,
+                     "batch": self._snapshot(b, self.state["revision"])},
                 )
 
             # 摘要已冻结且不同：冲突隔离。
@@ -352,10 +594,18 @@ class Store:
             }
             b["votes"].append(vote)
 
-            snapshot = self._snapshot(b, self.state["revision"] + 1)
-            certificate = None
-            # 达到阈值的瞬间在同一事务内封签；并发后到者只会看到已封存状态。
+            self.state["revision"] += 1
+            # 接受事件：与赞成票、（可能的）冻结与封签在同一次持久化提交内追加。
+            self._append_event_locked(
+                b, "vote_accepted", station, vote_id, EVENT_VOTE_ACCEPTED,
+                detail={"froze_config": frozen_now},
+                digest=digest, record_id=vote["id"], ts=vote["ts"],
+            )
+
+            snapshot = self._snapshot(b, self.state["revision"])
+            # 达到阈值的瞬间在同一事务内封签；并发临界区只会产生一个封签事件。
             if snapshot["yes_count"] >= b["threshold"]:
+                sealed_at = utc_now()
                 certificate = {
                     "serial": 1,
                     "batch_id": b["id"],
@@ -363,12 +613,19 @@ class Store:
                     "threshold": b["threshold"],
                     "stations": snapshot["yes_stations"],
                     "fingerprint": self._fingerprint({**b, "votes": b["votes"]}),
-                    "sealed_at": utc_now(),
+                    "sealed_at": sealed_at,
                     "immutable": True,
                 }
                 b["certificate"] = certificate
+                self._append_event_locked(
+                    b, "sealed", None, None, EVENT_SEALED,
+                    detail={"certificate_serial": certificate["serial"],
+                            "fingerprint": certificate["fingerprint"],
+                            "yes_stations": snapshot["yes_stations"]},
+                    digest=b["digest"], ts=sealed_at,
+                )
 
-            self.state["revision"] += 1
+            # 赞成票、接受流水、封签证书与封签流水原子落盘（单次 fsync 提交）。
             self._persist_locked()
             return 200, {
                 "accepted": True,
@@ -444,6 +701,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve_index()
             elif path == "/api/batches":
                 self._send_json(200, {"batches": STORE.list_snapshots()})
+            elif path.startswith("/api/batches/") and path.endswith("/events"):
+                batch_id = unquote(path[len("/api/batches/"):-len("/events")])
+                qs = parse_qs(parsed.query)
+                cursor = (qs.get("cursor") or [None])[0]
+                limit_raw = (qs.get("limit") or [None])[0]
+                self._send_json(200, STORE.get_events(batch_id, cursor=cursor, limit_raw=limit_raw))
             elif path.startswith("/api/batches/"):
                 batch_id = unquote(path[len("/api/batches/"):])
                 self._send_json(200, {"batch": STORE.get_batch_snapshot(batch_id)})
